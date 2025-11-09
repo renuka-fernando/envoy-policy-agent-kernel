@@ -15,7 +15,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	structpb "google.golang.org/protobuf/types/known/structpb"
 )
 
 var _ ext_proc_svc.ExternalProcessorServer = &server{}
@@ -106,87 +105,15 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 
 		case *ext_proc_pb.ProcessingRequest_RequestBody:
 			logrus.Print("******** Processing Request Body ******** body: ", string(value.RequestBody.Body))
-			resp = &ext_proc_pb.ProcessingResponse{
-				DynamicMetadata: &structpb.Struct{
-					Fields: map[string]*structpb.Value{
-						"envoy.filters.http.ext_proc": {
-							Kind: &structpb.Value_StructValue{
-								StructValue: &structpb.Struct{
-									Fields: map[string]*structpb.Value{
-										"my_dynamic_key": {
-											Kind: &structpb.Value_StringValue{
-												StringValue: "my_dynamic_value",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				Response: &ext_proc_pb.ProcessingResponse_RequestBody{
-					RequestBody: &ext_proc_pb.BodyResponse{
-						Response: &ext_proc_pb.CommonResponse{
-							HeaderMutation: &ext_proc_pb.HeaderMutation{
-								RemoveHeaders: []string{
-									"remove-this-header",
-								},
-								// SetHeaders: []*core_v3.HeaderValueOption{
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      "hello",
-								// 			RawValue: []byte("world!!!"),
-								// 		},
-								// 	},
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      "content-length",
-								// 			RawValue: []byte("11"),
-								// 		},
-								// 	},
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key: ":method",
-								// 			// Value: "PUT",
-								// 			RawValue: []byte("PUT"),
-								// 		},
-								// 	},
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      ":path",
-								// 			RawValue: []byte("/foo"),
-								// 		},
-								// 	},
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      "foo",
-								// 			RawValue: []byte("bar1"),
-								// 		},
-								// 	},
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      "foo",
-								// 			RawValue: []byte("bar2,bar3"),
-								// 		},
-								// 	},
-								// },
-							},
-							BodyMutation: &ext_proc_pb.BodyMutation{
-								// Mutation: &pb.BodyMutation_Body{
-								// 	Body: []byte("Hello World"),
-								// },
-								Mutation: &ext_proc_pb.BodyMutation_StreamedResponse{
-									StreamedResponse: &ext_proc_pb.StreamedBodyResponse{
-										Body:        value.RequestBody.Body,
-										EndOfStream: value.RequestBody.EndOfStream,
-									},
-								},
-							},
-							ClearRouteCache: false,
-						},
-					},
-				},
+			body := value.RequestBody.Body
+			requestContext.Request.Body = &policy.BodyData{
+				Included:    true,
+				Data:        body,
+				EndOfStream: value.RequestBody.EndOfStream,
+				StreamIndex: requestContext.Request.Body.StreamIndex + 1,
 			}
+			policyExecution.ExecuteRequestPolicies(ctx, requestContext)
+
 		case *ext_proc_pb.ProcessingRequest_ResponseHeaders:
 			headers := value.ResponseHeaders.Headers.GetHeaders()
 			headersMap := make(map[string]string)

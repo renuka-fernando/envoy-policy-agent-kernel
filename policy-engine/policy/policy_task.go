@@ -7,16 +7,21 @@ type PolicyTask struct {
 	// Policy is the user-implemented policy to be executed
 	Policy Policy
 
-	// Status tracks the execution state of this policy task
-	Status PolicyTaskStatus
+	// status tracks the execution state of this policy task
+	status PolicyTaskStatus
 }
 
 // PolicyTaskStatus tracks the execution state of a PolicyTask
 type PolicyTaskStatus struct {
-	// IsCompleted indicates whether this policy task has finished execution
-	IsCompleted bool
+	// isCompleted indicates whether this policy task has finished execution
+	isCompleted bool
 
-	// LastExecutedStreamIndex tracks the last stream index where this policy was executed
+	// lastExecutedStreamIndex tracks the last stream index where this policy was executed
 	// Used to track progress through streaming data or multi-phase execution
-	LastExecutedStreamIndex int
+	lastExecutedStreamIndex int
+
+	// lastExecutedBodyByteIndex tracks the last body byte index where this policy was executed
+	// Used when BufferNextChunk is returned to determine which byte slice to provide
+	// to the policy on the next execution
+	lastExecutedBodyByteIndex int
 }

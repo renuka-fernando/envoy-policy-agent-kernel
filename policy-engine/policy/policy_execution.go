@@ -61,9 +61,9 @@ func NewPolicyExecution(policies []Policy) *PolicyExecution {
 	for i, p := range policies {
 		policyTasks[i] = PolicyTask{
 			Policy: p,
-			Status: PolicyTaskStatus{
-				IsCompleted:             false,
-				LastExecutedStreamIndex: 0,
+			status: PolicyTaskStatus{
+				isCompleted:             false,
+				lastExecutedStreamIndex: 0,
 			},
 		}
 	}
@@ -73,16 +73,10 @@ func NewPolicyExecution(policies []Policy) *PolicyExecution {
 		Status:   ExecutionStatusPending,
 	}
 
-	// Initialize body access flags
-	pe.Init()
-
-	return pe
-}
-
-// Init initializes the PolicyExecution by determining body access requirements
-func (pe *PolicyExecution) Init() {
 	pe.accessRequestBody = pe.checkAccessRequestBody()
 	pe.accessResponseBody = pe.checkAccessResponseBody()
+
+	return pe
 }
 
 // checkAccessRequestBody checks if any policy needs to access the request body
@@ -118,7 +112,7 @@ func (pe *PolicyExecution) AccessResponseBody() bool {
 // AllCompleted checks if all policy tasks have completed
 func (pe *PolicyExecution) AllCompleted() bool {
 	for _, p := range pe.Policies {
-		if !p.Status.IsCompleted {
+		if !p.status.isCompleted {
 			return false
 		}
 	}
@@ -128,7 +122,7 @@ func (pe *PolicyExecution) AllCompleted() bool {
 // AnyCompleted checks if any policy task has completed
 func (pe *PolicyExecution) AnyCompleted() bool {
 	for _, p := range pe.Policies {
-		if p.Status.IsCompleted {
+		if p.status.isCompleted {
 			return true
 		}
 	}
@@ -145,7 +139,7 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 
 	for i := range pe.Policies {
 		p := &pe.Policies[i]
-		if p.Status.IsCompleted {
+		if p.status.isCompleted {
 			logrus.Debugf("Skipping completed policy: %s", p.Policy.Name())
 			continue
 		}
@@ -160,7 +154,7 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 		}
 
 		if !p.Policy.AccessRequestBody() {
-			p.Status.IsCompleted = true
+			p.status.isCompleted = true
 		}
 	}
 
