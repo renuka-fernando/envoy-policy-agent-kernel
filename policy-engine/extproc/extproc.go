@@ -8,9 +8,9 @@ import (
 	policy "policy-engine/policy"
 
 	core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	ext_procv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
-	ext_proc_v3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	ext_proc_filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
+	ext_proc_pb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	ext_proc_svc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,23 +18,26 @@ import (
 	structpb "google.golang.org/protobuf/types/known/structpb"
 )
 
-var _ ext_proc_v3.ExternalProcessorServer = &server{}
+var _ ext_proc_svc.ExternalProcessorServer = &server{}
 
 type server struct {
 }
 
 // Process implements ext_procv3.ExternalProcessorServer.
-func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServer) error {
+func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessServer) error {
 	ctx := processServer.Context()
 	requestHeadersMap := make(map[string][]string)
 	requestContext := &policy.RequestContext{
 		Metadata: make(map[string]string),
 		Request: &policy.RequestData{
-			BodyIncluded: false,
+			Body: &policy.BodyData{
+				Included:    false,
+				StreamIndex: 0,
+			},
 		},
 	}
 
-	var policyList []policy.Policy
+	var policyList []policy.PolicyTask
 
 	for {
 		select {
@@ -52,9 +55,9 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 		}
 		logrus.Info(fmt.Sprintf("******** Received Ext Processing Request ********\n%v", req))
 
-		resp := &pb.ProcessingResponse{}
+		resp := &ext_proc_pb.ProcessingResponse{}
 		switch value := req.Request.(type) {
-		case *pb.ProcessingRequest_RequestHeaders:
+		case *ext_proc_pb.ProcessingRequest_RequestHeaders:
 			headers := value.RequestHeaders.Headers.GetHeaders()
 			for _, v := range headers {
 				requestHeadersMap[v.Key] = append(requestHeadersMap[v.Key], string(v.GetRawValue()))
@@ -88,9 +91,9 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 			policyList = agent.ListPolicies()
 			if policy.AccessRequestBody(policyList) {
 				logrus.Print("******** Accessing Request Body ********")
-				resp = &pb.ProcessingResponse{
-					ModeOverride: &ext_procv3.ProcessingMode{
-						RequestBodyMode: ext_procv3.ProcessingMode_FULL_DUPLEX_STREAMED,
+				resp = &ext_proc_pb.ProcessingResponse{
+					ModeOverride: &ext_proc_filter.ProcessingMode{
+						RequestBodyMode: ext_proc_filter.ProcessingMode_FULL_DUPLEX_STREAMED,
 					},
 				}
 				if err := processServer.Send(resp); err != nil {
@@ -101,9 +104,9 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 
 			policy.ExecuteRequestPolicies(ctx, policyList, requestContext)
 
-		case *pb.ProcessingRequest_RequestBody:
+		case *ext_proc_pb.ProcessingRequest_RequestBody:
 			logrus.Print("******** Processing Request Body ******** body: ", string(value.RequestBody.Body))
-			resp = &pb.ProcessingResponse{
+			resp = &ext_proc_pb.ProcessingResponse{
 				DynamicMetadata: &structpb.Struct{
 					Fields: map[string]*structpb.Value{
 						"envoy.filters.http.ext_proc": {
@@ -121,10 +124,10 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 						},
 					},
 				},
-				Response: &pb.ProcessingResponse_RequestBody{
-					RequestBody: &pb.BodyResponse{
-						Response: &pb.CommonResponse{
-							HeaderMutation: &pb.HeaderMutation{
+				Response: &ext_proc_pb.ProcessingResponse_RequestBody{
+					RequestBody: &ext_proc_pb.BodyResponse{
+						Response: &ext_proc_pb.CommonResponse{
+							HeaderMutation: &ext_proc_pb.HeaderMutation{
 								RemoveHeaders: []string{
 									"remove-this-header",
 								},
@@ -168,12 +171,12 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 								// 	},
 								// },
 							},
-							BodyMutation: &pb.BodyMutation{
+							BodyMutation: &ext_proc_pb.BodyMutation{
 								// Mutation: &pb.BodyMutation_Body{
 								// 	Body: []byte("Hello World"),
 								// },
-								Mutation: &pb.BodyMutation_StreamedResponse{
-									StreamedResponse: &pb.StreamedBodyResponse{
+								Mutation: &ext_proc_pb.BodyMutation_StreamedResponse{
+									StreamedResponse: &ext_proc_pb.StreamedBodyResponse{
 										Body:        value.RequestBody.Body,
 										EndOfStream: value.RequestBody.EndOfStream,
 									},
@@ -184,7 +187,7 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 					},
 				},
 			}
-		case *pb.ProcessingRequest_ResponseHeaders:
+		case *ext_proc_pb.ProcessingRequest_ResponseHeaders:
 			headers := value.ResponseHeaders.Headers.GetHeaders()
 			headersMap := make(map[string]string)
 			for _, v := range headers {
@@ -198,11 +201,11 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 			}
 
 			logrus.Print(fmt.Sprintf("******** Processing Response Headers ******** status:%v", status))
-			resp = &pb.ProcessingResponse{
-				Response: &pb.ProcessingResponse_ResponseHeaders{
-					ResponseHeaders: &pb.HeadersResponse{
-						Response: &pb.CommonResponse{
-							HeaderMutation: &pb.HeaderMutation{
+			resp = &ext_proc_pb.ProcessingResponse{
+				Response: &ext_proc_pb.ProcessingResponse_ResponseHeaders{
+					ResponseHeaders: &ext_proc_pb.HeadersResponse{
+						Response: &ext_proc_pb.CommonResponse{
+							HeaderMutation: &ext_proc_pb.HeaderMutation{
 								SetHeaders: []*core_v3.HeaderValueOption{
 									{
 										Header: &core_v3.HeaderValue{
@@ -222,21 +225,21 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 					},
 				},
 			}
-		case *pb.ProcessingRequest_ResponseBody:
+		case *ext_proc_pb.ProcessingRequest_ResponseBody:
 			logrus.Print("******** Processing Response Body ******** body: ", string(value.ResponseBody.Body))
 			logrus.Printf("******** Processing Response Body ******** validate: %v", value.ResponseBody.Validate())
 
 			// body := "Hello World!! Response!!!"
-			resp = &pb.ProcessingResponse{
-				Response: &pb.ProcessingResponse_ResponseBody{
-					ResponseBody: &pb.BodyResponse{
-						Response: &pb.CommonResponse{
+			resp = &ext_proc_pb.ProcessingResponse{
+				Response: &ext_proc_pb.ProcessingResponse_ResponseBody{
+					ResponseBody: &ext_proc_pb.BodyResponse{
+						Response: &ext_proc_pb.CommonResponse{
 							// BodyMutation: &pb.BodyMutation{
 							// 	Mutation: &pb.BodyMutation_Body{
 							// 		Body: []byte(body),
 							// 	},
 							// },
-							HeaderMutation: &pb.HeaderMutation{
+							HeaderMutation: &ext_proc_pb.HeaderMutation{
 								// SetHeaders: []*core_v3.HeaderValueOption{
 								// 	{
 								// 		Header: &core_v3.HeaderValue{
@@ -247,9 +250,9 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 								// },
 								RemoveHeaders: []string{"x-wso2-response-fault-flag"},
 							},
-							BodyMutation: &pb.BodyMutation{
-								Mutation: &pb.BodyMutation_StreamedResponse{
-									StreamedResponse: &pb.StreamedBodyResponse{
+							BodyMutation: &ext_proc_pb.BodyMutation{
+								Mutation: &ext_proc_pb.BodyMutation_StreamedResponse{
+									StreamedResponse: &ext_proc_pb.StreamedBodyResponse{
 										Body:        value.ResponseBody.Body,
 										EndOfStream: value.ResponseBody.EndOfStream,
 									},
@@ -270,6 +273,6 @@ func (s *server) Process(processServer ext_proc_v3.ExternalProcessor_ProcessServ
 
 func NewServer() *grpc.Server {
 	gs := grpc.NewServer()
-	ext_proc_v3.RegisterExternalProcessorServer(gs, &server{})
+	ext_proc_svc.RegisterExternalProcessorServer(gs, &server{})
 	return gs
 }

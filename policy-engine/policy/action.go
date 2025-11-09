@@ -45,6 +45,22 @@ type UpstreamResponse struct {
 
 func (UpstreamResponse) isRequestAction() {}
 
+// BufferNextChunk instructs ext proc to iterate to the next body chunk
+// This action does not execute policy, it signals ext proc to continue buffering
+// Works for both request and response flows
+type BufferNextChunk struct{}
+
+func (BufferNextChunk) isRequestAction()  {}
+func (BufferNextChunk) isResponseAction() {}
+
+// BufferFullBody instructs ext proc to buffer the entire body
+// This action does not execute policy, it signals ext proc to buffer the complete body
+// Works for both request and response flows
+type BufferFullBody struct{}
+
+func (BufferFullBody) isRequestAction()  {}
+func (BufferFullBody) isResponseAction() {}
+
 // ==================== Response Actions ====================
 
 // DownstreamResponse sends a response downstream to the client with optional modifications
