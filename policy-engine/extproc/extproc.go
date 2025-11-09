@@ -37,7 +37,7 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 		},
 	}
 
-	var policyList []policy.PolicyTask
+	var policyExecution *policy.PolicyExecution
 
 	for {
 		select {
@@ -88,8 +88,8 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 
 			logrus.Printf("******** Processing Request Headers ******** method: %s, path: %s", requestContext.Request.Method, requestContext.Request.Path)
 
-			policyList = agent.ListPolicies()
-			if policy.AccessRequestBody(policyList) {
+			policyExecution = policy.NewPolicyExecution(agent.ListPolicies())
+			if policyExecution.AccessRequestBody() {
 				logrus.Print("******** Accessing Request Body ********")
 				resp = &ext_proc_pb.ProcessingResponse{
 					ModeOverride: &ext_proc_filter.ProcessingMode{
@@ -102,7 +102,7 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				continue
 			}
 
-			policy.ExecuteRequestPolicies(ctx, policyList, requestContext)
+			policyExecution.ExecuteRequestPolicies(ctx, requestContext)
 
 		case *ext_proc_pb.ProcessingRequest_RequestBody:
 			logrus.Print("******** Processing Request Body ******** body: ", string(value.RequestBody.Body))

@@ -5,10 +5,8 @@ import (
 	policy "policy-engine/policy"
 )
 
-func ListPolicies() []policy.PolicyTask {
-	return []policy.PolicyTask{
-		policy.PolicyTask{
-			Policy: &policies.JWTValidationPolicy{},
-		},
+func ListPolicies() []policy.Policy {
+	return []policy.Policy{
+		&policies.JWTValidationPolicy{},
 	}
 }
