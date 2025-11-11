@@ -11,6 +11,7 @@ import (
 	ext_proc_filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	ext_proc_pb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	ext_proc_svc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,8 +28,17 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 	ctx := processServer.Context()
 	requestHeadersMap := make(map[string][]string)
 	requestContext := &policy.RequestContext{
-		Metadata: make(map[string]string),
 		Request: &policy.RequestData{
+			Body: &policy.BodyData{
+				Included:    false,
+				StreamIndex: 0,
+			},
+		},
+	}
+
+	responseContext := &policy.ResponseContext{
+		Request:  &policy.RequestData{}, // Will be populated from requestContext
+		Response: &policy.ResponseData{
 			Body: &policy.BodyData{
 				Included:    false,
 				StreamIndex: 0,
@@ -87,7 +97,8 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 
 			logrus.Printf("******** Processing Request Headers ******** method: %s, path: %s", requestContext.Request.Method, requestContext.Request.Path)
 
-			policyExecution = policy.NewPolicyExecution(agent.ListPolicies())
+			requestPolicies, responsePolicies := agent.ListPolicies()
+			policyExecution = policy.NewPolicyExecution(requestPolicies, responsePolicies)
 			if policyExecution.AccessRequestBody() {
 				logrus.Print("******** Accessing Request Body ********")
 				resp = &ext_proc_pb.ProcessingResponse{
@@ -101,33 +112,101 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				continue
 			}
 
-			policyExecution.ExecuteRequestPolicies(ctx, requestContext)
+			// Execute policies for request headers
+			// Note: needMoreData will be false here since we haven't received body yet
+			_ = policyExecution.ExecuteRequestPolicies(ctx, requestContext, nil)
 
 		case *ext_proc_pb.ProcessingRequest_RequestBody:
 			logrus.Print("******** Processing Request Body ******** body: ", string(value.RequestBody.Body))
-			body := value.RequestBody.Body
-			requestContext.Request.Body = &policy.BodyData{
+			bodyData := &policy.BodyData{
 				Included:    true,
-				Data:        body,
+				Data:        value.RequestBody.Body,
 				EndOfStream: value.RequestBody.EndOfStream,
 				StreamIndex: requestContext.Request.Body.StreamIndex + 1,
 			}
-			policyExecution.ExecuteRequestPolicies(ctx, requestContext)
+			result := policyExecution.ExecuteRequestPolicies(ctx, requestContext, bodyData)
+
+			// Check if buffer size exceeded or other fatal error
+			if policyExecution.Error != nil {
+				logrus.Errorf("Policy execution error: %v", policyExecution.Error)
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_ImmediateResponse{
+						ImmediateResponse: &ext_proc_pb.ImmediateResponse{
+							Status: &type_v3.HttpStatus{
+								Code: 413, // Payload Too Large
+							},
+							Body:    []byte(fmt.Sprintf("Request body buffer limit exceeded: %v", policyExecution.Error)),
+							Headers: &ext_proc_pb.HeaderMutation{},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending error response", err)
+				}
+				continue
+			}
+
+			// If policy requested more data, send empty body mutation to continue streaming
+			if result.BufferAction == policy.BufferActionBufferNext {
+				logrus.Debug("Policy requested more data, continuing to buffer")
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_RequestBody{
+						RequestBody: &ext_proc_pb.BodyResponse{
+							Response: &ext_proc_pb.CommonResponse{
+								BodyMutation: &ext_proc_pb.BodyMutation{
+									Mutation: &ext_proc_pb.BodyMutation_Body{
+										Body: []byte{}, // Empty mutation continues streaming
+									},
+								},
+							},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending continue buffering response", err)
+				}
+				continue
+			}
+
+			// TODO: Process policy results and apply actions (mutations, headers, etc.)
 
 		case *ext_proc_pb.ProcessingRequest_ResponseHeaders:
 			headers := value.ResponseHeaders.Headers.GetHeaders()
-			headersMap := make(map[string]string)
+			responseHeadersMap := make(map[string][]string)
 			for _, v := range headers {
-				headersMap[v.Key] = string(v.GetRawValue())
+				responseHeadersMap[v.Key] = append(responseHeadersMap[v.Key], string(v.GetRawValue()))
 			}
 
-			status := headersMap[":status"]
-			_, isFaultFlow := headersMap["x-wso2-response-fault-flag"]
-			if isFaultFlow {
-				logrus.Print("ERROR FLOW")
+			// Populate response context
+			responseContext.Response.Headers = responseHeadersMap
+			responseContext.Request = requestContext.Request // Link request data
+			// Note: responseContext.Metadata will be set to policyExecution.Metadata in ExecuteResponsePolicies
+
+			// Parse status code
+			if len(responseHeadersMap[":status"]) > 0 {
+				var statusCode int32
+				fmt.Sscanf(responseHeadersMap[":status"][0], "%d", &statusCode)
+				responseContext.Response.StatusCode = statusCode
 			}
 
-			logrus.Print(fmt.Sprintf("******** Processing Response Headers ******** status:%v", status))
+			logrus.Printf("******** Processing Response Headers ******** status:%v", responseContext.Response.StatusCode)
+
+			// Check if any policy needs response body access
+			if policyExecution != nil && policyExecution.AccessResponseBody() {
+				logrus.Print("******** Accessing Response Body ********")
+				resp = &ext_proc_pb.ProcessingResponse{
+					ModeOverride: &ext_proc_filter.ProcessingMode{
+						ResponseBodyMode: ext_proc_filter.ProcessingMode_FULL_DUPLEX_STREAMED,
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending ext proc ProcessingRequest_ResponseHeaders response", err)
+				}
+				continue
+			}
+
+			// If no body access needed, execute response policies now
+			// (currently just pass through with example header mutations)
 			resp = &ext_proc_pb.ProcessingResponse{
 				Response: &ext_proc_pb.ProcessingResponse_ResponseHeaders{
 					ResponseHeaders: &ext_proc_pb.HeadersResponse{
@@ -154,27 +233,67 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 			}
 		case *ext_proc_pb.ProcessingRequest_ResponseBody:
 			logrus.Print("******** Processing Response Body ******** body: ", string(value.ResponseBody.Body))
-			logrus.Printf("******** Processing Response Body ******** validate: %v", value.ResponseBody.Validate())
+			bodyData := &policy.BodyData{
+				Included:    true,
+				Data:        value.ResponseBody.Body,
+				EndOfStream: value.ResponseBody.EndOfStream,
+				StreamIndex: responseContext.Response.Body.StreamIndex + 1,
+			}
 
-			// body := "Hello World!! Response!!!"
+			result := policyExecution.ExecuteResponsePolicies(ctx, responseContext, bodyData)
+
+			// Check if buffer size exceeded or other fatal error
+			if policyExecution.Error != nil {
+				logrus.Errorf("Policy execution error: %v", policyExecution.Error)
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_ImmediateResponse{
+						ImmediateResponse: &ext_proc_pb.ImmediateResponse{
+							Status: &type_v3.HttpStatus{
+								Code: 413, // Payload Too Large
+							},
+							Body:    []byte(fmt.Sprintf("Response body buffer limit exceeded: %v", policyExecution.Error)),
+							Headers: &ext_proc_pb.HeaderMutation{},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending error response", err)
+				}
+				continue
+			}
+
+			// If policy requested more data, send empty body mutation to continue streaming
+			if result.BufferAction == policy.BufferActionBufferNext {
+				logrus.Debug("Policy requested more data, continuing to buffer")
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_ResponseBody{
+						ResponseBody: &ext_proc_pb.BodyResponse{
+							Response: &ext_proc_pb.CommonResponse{
+								BodyMutation: &ext_proc_pb.BodyMutation{
+									Mutation: &ext_proc_pb.BodyMutation_StreamedResponse{
+										StreamedResponse: &ext_proc_pb.StreamedBodyResponse{
+											Body:        []byte{}, // Empty mutation continues streaming
+											EndOfStream: false,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending continue buffering response", err)
+				}
+				continue
+			}
+
+			// TODO: Process policy results and apply actions (mutations, headers, etc.)
+			// For now, just pass through the response body
 			resp = &ext_proc_pb.ProcessingResponse{
 				Response: &ext_proc_pb.ProcessingResponse_ResponseBody{
 					ResponseBody: &ext_proc_pb.BodyResponse{
 						Response: &ext_proc_pb.CommonResponse{
-							// BodyMutation: &pb.BodyMutation{
-							// 	Mutation: &pb.BodyMutation_Body{
-							// 		Body: []byte(body),
-							// 	},
-							// },
 							HeaderMutation: &ext_proc_pb.HeaderMutation{
-								// SetHeaders: []*core_v3.HeaderValueOption{
-								// 	{
-								// 		Header: &core_v3.HeaderValue{
-								// 			Key:      "Content-Length",
-								// 			RawValue: []byte(fmt.Sprint(len(body))),
-								// 		},
-								// 	},
-								// },
 								RemoveHeaders: []string{"x-wso2-response-fault-flag"},
 							},
 							BodyMutation: &ext_proc_pb.BodyMutation{

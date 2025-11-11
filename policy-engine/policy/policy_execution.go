@@ -2,18 +2,26 @@ package policy
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
-// PolicyExecution represents the execution state and metadata for a collection of policies.
-// It encapsulates a set of policy tasks along with their collective execution status,
-// allowing tracking of the overall policy execution lifecycle independently from
-// individual policy task states.
+// PolicyExecution represents the execution state and metadata for the complete
+// request-response lifecycle. It manages separate policy sets for request and
+// response phases, tracks their execution status, and maintains lifecycle metadata
+// that policies can read, set, or delete throughout the entire lifecycle.
 type PolicyExecution struct {
-	// Policies contains the list of policy tasks to be executed
-	Policies []PolicyTask
+	// RequestPolicies contains policy tasks executed during the request phase
+	RequestPolicies []PolicyTask
+
+	// ResponsePolicies contains policy tasks executed during the response phase
+	ResponsePolicies []PolicyTask
+
+	// Metadata holds lifecycle metadata that persists across request and response phases.
+	// Policies can set, read, and delete metadata entries throughout the lifecycle.
+	Metadata map[string]string
 
 	// Status tracks the overall execution state of all policies
 	Status ExecutionStatus
@@ -32,6 +40,12 @@ type PolicyExecution struct {
 
 	// accessResponseBody indicates if any policy needs to access the response body
 	accessResponseBody bool
+
+	// requestBodyBuffer accumulates request body chunks for incremental processing
+	requestBodyBuffer *BodyBuffer
+
+	// responseBodyBuffer accumulates response body chunks for incremental processing
+	responseBodyBuffer *BodyBuffer
 }
 
 // ExecutionStatus represents the overall state of policy execution
@@ -54,12 +68,140 @@ const (
 	ExecutionStatusPartial ExecutionStatus = "partial"
 )
 
-// NewPolicyExecution creates a new PolicyExecution with the given policies
-// It wraps each policy in a PolicyTask with initial status
-func NewPolicyExecution(policies []Policy) *PolicyExecution {
-	policyTasks := make([]PolicyTask, len(policies))
-	for i, p := range policies {
-		policyTasks[i] = PolicyTask{
+// BufferAction represents the buffering action required after policy execution
+type BufferAction string
+
+const (
+	// BufferActionNone indicates no buffering action is needed
+	BufferActionNone BufferAction = "none"
+
+	// BufferActionBufferNext indicates the policy needs more data chunks
+	BufferActionBufferNext BufferAction = "buffer_next"
+
+	// BufferActionFullBuffer indicates the full buffer is needed before proceeding
+	BufferActionFullBuffer BufferAction = "full_buffer"
+)
+
+// PolicyExecutionResult represents the result of executing policies
+type PolicyExecutionResult struct {
+	// BufferAction indicates what buffering action is required
+	BufferAction BufferAction
+}
+
+// BodyBuffer accumulates body chunks across streaming requests/responses.
+// It allows policies to incrementally consume bytes and request more data.
+type BodyBuffer struct {
+	data        []byte // Accumulated bytes across all chunks
+	streamIndex int    // Last stream index added to buffer
+	endOfStream bool   // Whether the final chunk has been received
+	maxSize     int    // Maximum buffer size in bytes
+}
+
+// BufferSizeExceededError represents an error when the body buffer size limit is exceeded
+type BufferSizeExceededError struct {
+	CurrentSize int
+	ChunkSize   int
+	MaxSize     int
+	Err         error
+}
+
+func (e *BufferSizeExceededError) Error() string {
+	return fmt.Sprintf("buffer size limit exceeded: current=%d, chunk=%d, max=%d",
+		e.CurrentSize, e.ChunkSize, e.MaxSize)
+}
+
+func (e *BufferSizeExceededError) Unwrap() error {
+	return e.Err
+}
+
+// BufferMoreDataAtEndOfStreamError represents an error when a policy requests more data
+// but the stream has already ended
+type BufferMoreDataAtEndOfStreamError struct {
+	PolicyName string
+	Phase      string // "request" or "response"
+}
+
+func (e *BufferMoreDataAtEndOfStreamError) Error() string {
+	return fmt.Sprintf("policy %s requested more data but %s stream has already ended",
+		e.PolicyName, e.Phase)
+}
+
+// DefaultMaxBufferSize is the default maximum buffer size (1MB)
+const DefaultMaxBufferSize = 1024 * 1024
+
+// NewBodyBuffer creates a new BodyBuffer with the specified maximum size
+func NewBodyBuffer(maxSize int) *BodyBuffer {
+	return &BodyBuffer{
+		data:        make([]byte, 0),
+		streamIndex: -1,
+		endOfStream: false,
+		maxSize:     maxSize,
+	}
+}
+
+// Append adds a chunk of data to the buffer
+// Returns a BufferSizeExceededError if appending would exceed maxSize
+func (b *BodyBuffer) Append(chunk []byte, streamIdx int, eos bool) error {
+	if len(b.data)+len(chunk) > b.maxSize {
+		return &BufferSizeExceededError{
+			CurrentSize: len(b.data),
+			ChunkSize:   len(chunk),
+			MaxSize:     b.maxSize,
+		}
+	}
+	b.data = append(b.data, chunk...)
+	b.streamIndex = streamIdx
+	b.endOfStream = eos
+	return nil
+}
+
+// GetSlice returns a slice of the buffer starting from the given byte index
+func (b *BodyBuffer) GetSlice(fromIndex int) []byte {
+	if fromIndex >= len(b.data) {
+		return []byte{}
+	}
+	return b.data[fromIndex:]
+}
+
+// Size returns the total number of bytes currently buffered
+func (b *BodyBuffer) Size() int {
+	return len(b.data)
+}
+
+// StreamIndex returns the last stream index added to the buffer
+func (b *BodyBuffer) StreamIndex() int {
+	return b.streamIndex
+}
+
+// EndOfStream returns whether the final chunk has been received
+func (b *BodyBuffer) EndOfStream() bool {
+	return b.endOfStream
+}
+
+// Reset clears the buffer and resets its state
+func (b *BodyBuffer) Reset() {
+	b.data = b.data[:0]
+	b.streamIndex = -1
+	b.endOfStream = false
+}
+
+// NewPolicyExecution creates a new PolicyExecution with separate request and response policies.
+// It wraps each policy in a PolicyTask with initial status and initializes lifecycle metadata.
+func NewPolicyExecution(requestPolicies []Policy, responsePolicies []Policy) *PolicyExecution {
+	requestTasks := make([]PolicyTask, len(requestPolicies))
+	for i, p := range requestPolicies {
+		requestTasks[i] = PolicyTask{
+			Policy: p,
+			status: PolicyTaskStatus{
+				isCompleted:             false,
+				lastExecutedStreamIndex: 0,
+			},
+		}
+	}
+
+	responseTasks := make([]PolicyTask, len(responsePolicies))
+	for i, p := range responsePolicies {
+		responseTasks[i] = PolicyTask{
 			Policy: p,
 			status: PolicyTaskStatus{
 				isCompleted:             false,
@@ -69,8 +211,12 @@ func NewPolicyExecution(policies []Policy) *PolicyExecution {
 	}
 
 	pe := &PolicyExecution{
-		Policies: policyTasks,
-		Status:   ExecutionStatusPending,
+		RequestPolicies:    requestTasks,
+		ResponsePolicies:   responseTasks,
+		Metadata:           make(map[string]string),
+		Status:             ExecutionStatusPending,
+		requestBodyBuffer:  NewBodyBuffer(DefaultMaxBufferSize),
+		responseBodyBuffer: NewBodyBuffer(DefaultMaxBufferSize),
 	}
 
 	pe.accessRequestBody = pe.checkAccessRequestBody()
@@ -79,9 +225,9 @@ func NewPolicyExecution(policies []Policy) *PolicyExecution {
 	return pe
 }
 
-// checkAccessRequestBody checks if any policy needs to access the request body
+// checkAccessRequestBody checks if any request policy needs to access the request body
 func (pe *PolicyExecution) checkAccessRequestBody() bool {
-	for _, p := range pe.Policies {
+	for _, p := range pe.RequestPolicies {
 		if p.Policy.AccessRequestBody() {
 			return true
 		}
@@ -89,9 +235,9 @@ func (pe *PolicyExecution) checkAccessRequestBody() bool {
 	return false
 }
 
-// checkAccessResponseBody checks if any policy needs to access the response body
+// checkAccessResponseBody checks if any response policy needs to access the response body
 func (pe *PolicyExecution) checkAccessResponseBody() bool {
-	for _, p := range pe.Policies {
+	for _, p := range pe.ResponsePolicies {
 		if p.Policy.AccessResponseBody() {
 			return true
 		}
@@ -109,9 +255,14 @@ func (pe *PolicyExecution) AccessResponseBody() bool {
 	return pe.accessResponseBody
 }
 
-// AllCompleted checks if all policy tasks have completed
+// AllCompleted checks if all policy tasks (both request and response) have completed
 func (pe *PolicyExecution) AllCompleted() bool {
-	for _, p := range pe.Policies {
+	for _, p := range pe.RequestPolicies {
+		if !p.status.isCompleted {
+			return false
+		}
+	}
+	for _, p := range pe.ResponsePolicies {
 		if !p.status.isCompleted {
 			return false
 		}
@@ -119,9 +270,14 @@ func (pe *PolicyExecution) AllCompleted() bool {
 	return true
 }
 
-// AnyCompleted checks if any policy task has completed
+// AnyCompleted checks if any policy task (request or response) has completed
 func (pe *PolicyExecution) AnyCompleted() bool {
-	for _, p := range pe.Policies {
+	for _, p := range pe.RequestPolicies {
+		if p.status.isCompleted {
+			return true
+		}
+	}
+	for _, p := range pe.ResponsePolicies {
 		if p.status.isCompleted {
 			return true
 		}
@@ -129,31 +285,91 @@ func (pe *PolicyExecution) AnyCompleted() bool {
 	return false
 }
 
-// ExecuteRequestPolicies executes all policies in the execution for request processing
-func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *RequestContext) {
+// ExecuteRequestPolicies executes all request policies for request processing.
+// It handles streaming body data by accumulating chunks in a buffer and providing
+// incremental slices to policies based on their consumption progress.
+// The request context uses the PolicyExecution's lifecycle metadata directly,
+// so policies can directly set, modify, or delete metadata entries.
+// bodyData contains the current chunk of body data to process (can be nil if no body).
+// Returns a PolicyExecutionResult with execution details.
+func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *RequestContext, bodyData *BodyData) *PolicyExecutionResult {
 	// Mark execution as in progress if it's pending
 	if pe.Status == ExecutionStatusPending {
 		pe.Status = ExecutionStatusInProgress
 		pe.StartedAt = time.Now()
 	}
 
-	for i := range pe.Policies {
-		p := &pe.Policies[i]
+	// Use PolicyExecution's lifecycle metadata directly
+	reqCtx.Metadata = pe.Metadata
+
+	// If body data is provided, append to buffer
+	if bodyData != nil && bodyData.Included {
+		err := pe.requestBodyBuffer.Append(
+			bodyData.Data,
+			bodyData.StreamIndex,
+			bodyData.EndOfStream,
+		)
+		if err != nil {
+			// Buffer size exceeded - store error and mark as failed
+			pe.Error = err
+			pe.Status = ExecutionStatusFailed
+			pe.CompletedAt = time.Now()
+			return &PolicyExecutionResult{BufferAction: BufferActionNone}
+		}
+	}
+
+	bufferAction := BufferActionNone
+
+	for i := range pe.RequestPolicies {
+		p := &pe.RequestPolicies[i]
 		if p.status.isCompleted {
 			logrus.Debugf("Skipping completed policy: %s", p.Policy.Name())
 			continue
 		}
 
-		result := p.Policy.HandleRequest(ctx, reqCtx)
-		if result != nil {
-			// Process result (e.g., update metadata, handle instructions)
-			for k, v := range result.Metadata {
-				reqCtx.Metadata[k] = v
-			}
-			// Handle instructions as needed
+		// Policies that don't access request body execute once and complete
+		if !p.Policy.AccessRequestBody() {
+			_ = p.Policy.HandleRequest(ctx, reqCtx)
+			p.status.isCompleted = true
+			continue
 		}
 
-		if !p.Policy.AccessRequestBody() {
+		// For policies that access the body, provide buffered data slice
+		bodySlice := pe.requestBodyBuffer.GetSlice(p.status.lastExecutedBodyByteIndex)
+
+		reqCtx.Request.Body = &BodyData{
+			Data:        bodySlice,
+			Included:    len(bodySlice) > 0 || pe.requestBodyBuffer.EndOfStream(),
+			EndOfStream: pe.requestBodyBuffer.EndOfStream(),
+			StreamIndex: pe.requestBodyBuffer.StreamIndex(),
+		}
+
+		result := p.Policy.HandleRequest(ctx, reqCtx)
+		if result != nil {
+			// Check if policy requested more data
+			if _, isBufferNextChunk := result.Action.(*BufferNextChunk); isBufferNextChunk {
+				// Error if policy requests more data but stream has already ended
+				if pe.requestBodyBuffer.EndOfStream() {
+					pe.Error = &BufferMoreDataAtEndOfStreamError{
+						PolicyName: p.Policy.Name(),
+						Phase:      "request",
+					}
+					pe.Status = ExecutionStatusFailed
+					pe.CompletedAt = time.Now()
+					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+				}
+				logrus.Debugf("Policy %s requested more data", p.Policy.Name())
+				bufferAction = BufferActionBufferNext
+				break // Stop executing policies, wait for next chunk
+			}
+
+			// Update the byte index to current buffer size (policy consumed data)
+			p.status.lastExecutedBodyByteIndex = pe.requestBodyBuffer.Size()
+			p.status.lastExecutedStreamIndex = pe.requestBodyBuffer.StreamIndex()
+		}
+
+		// Mark policy as completed if we've reached end of stream
+		if pe.requestBodyBuffer.EndOfStream() {
 			p.status.isCompleted = true
 		}
 	}
@@ -163,4 +379,88 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 		pe.Status = ExecutionStatusCompleted
 		pe.CompletedAt = time.Now()
 	}
+
+	return &PolicyExecutionResult{BufferAction: bufferAction}
+}
+
+// ExecuteResponsePolicies executes all response policies for response processing.
+// It handles streaming body data by accumulating chunks in a buffer and providing
+// incremental slices to policies based on their consumption progress.
+// The response context uses the PolicyExecution's lifecycle metadata directly,
+// so policies can directly set, modify, or delete metadata entries.
+// bodyData contains the current chunk of body data to process (can be nil if no body).
+// Returns a PolicyExecutionResult with execution details.
+func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx *ResponseContext, bodyData *BodyData) *PolicyExecutionResult {
+	// Use PolicyExecution's lifecycle metadata directly
+	respCtx.Metadata = pe.Metadata
+
+	// If body data is provided, append to buffer
+	if bodyData != nil && bodyData.Included {
+		err := pe.responseBodyBuffer.Append(
+			bodyData.Data,
+			bodyData.StreamIndex,
+			bodyData.EndOfStream,
+		)
+		if err != nil {
+			// Buffer size exceeded - store error and mark as failed
+			pe.Error = err
+			pe.Status = ExecutionStatusFailed
+			pe.CompletedAt = time.Now()
+			return &PolicyExecutionResult{BufferAction: BufferActionNone}
+		}
+	}
+
+	bufferAction := BufferActionNone
+
+	for i := range pe.ResponsePolicies {
+		p := &pe.ResponsePolicies[i]
+
+		// Policies that don't access response body execute once and complete
+		if !p.Policy.AccessResponseBody() {
+			_ = p.Policy.HandleResponse(ctx, respCtx)
+			continue
+		}
+
+		// For policies that access the body, provide buffered data slice
+		bodySlice := pe.responseBodyBuffer.GetSlice(p.status.lastExecutedBodyByteIndex)
+
+		// Create a temporary body data with the slice for this policy
+		originalBody := respCtx.Response.Body
+		respCtx.Response.Body = &BodyData{
+			Data:        bodySlice,
+			Included:    len(bodySlice) > 0 || pe.responseBodyBuffer.EndOfStream(),
+			EndOfStream: pe.responseBodyBuffer.EndOfStream(),
+			StreamIndex: pe.responseBodyBuffer.StreamIndex(),
+		}
+
+		result := p.Policy.HandleResponse(ctx, respCtx)
+
+		// Restore original body reference
+		respCtx.Response.Body = originalBody
+
+		if result != nil {
+			// Check if policy requested more data
+			if _, isBufferNextChunk := result.Action.(*BufferNextChunk); isBufferNextChunk {
+				// Error if policy requests more data but stream has already ended
+				if pe.responseBodyBuffer.EndOfStream() {
+					pe.Error = &BufferMoreDataAtEndOfStreamError{
+						PolicyName: p.Policy.Name(),
+						Phase:      "response",
+					}
+					pe.Status = ExecutionStatusFailed
+					pe.CompletedAt = time.Now()
+					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+				}
+				logrus.Debugf("Policy %s requested more data", p.Policy.Name())
+				bufferAction = BufferActionBufferNext
+				break // Stop executing policies, wait for next chunk
+			}
+
+			// Update the byte index to current buffer size (policy consumed data)
+			p.status.lastExecutedBodyByteIndex = pe.responseBodyBuffer.Size()
+			p.status.lastExecutedStreamIndex = pe.responseBodyBuffer.StreamIndex()
+		}
+	}
+
+	return &PolicyExecutionResult{BufferAction: bufferAction}
 }
