@@ -46,6 +46,12 @@ type PolicyExecution struct {
 
 	// responseBodyBuffer accumulates response body chunks for incremental processing
 	responseBodyBuffer *BodyBuffer
+
+	// waitingForFullRequestBuffer indicates we're buffering the full request body before executing
+	waitingForFullRequestBuffer bool
+
+	// waitingForFullResponseBuffer indicates we're buffering the full response body before executing
+	waitingForFullResponseBuffer bool
 }
 
 // ExecutionStatus represents the overall state of policy execution
@@ -318,6 +324,16 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 		}
 	}
 
+	// If waiting for full buffer and not end of stream, just continue buffering
+	if pe.waitingForFullRequestBuffer && !pe.requestBodyBuffer.EndOfStream() {
+		return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+	}
+
+	// Reset waiting flag if we reached end of stream
+	if pe.waitingForFullRequestBuffer && pe.requestBodyBuffer.EndOfStream() {
+		pe.waitingForFullRequestBuffer = false
+	}
+
 	bufferAction := BufferActionNone
 
 	for i := range pe.RequestPolicies {
@@ -346,8 +362,9 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 
 		result := p.Policy.HandleRequest(ctx, reqCtx)
 		if result != nil {
-			// Check if policy requested more data
-			if _, isBufferNextChunk := result.Action.(*BufferNextChunk); isBufferNextChunk {
+			// Check what action the policy returned
+			switch result.Action.(type) {
+			case *BufferNextChunk:
 				// Error if policy requests more data but stream has already ended
 				if pe.requestBodyBuffer.EndOfStream() {
 					pe.Error = &BufferMoreDataAtEndOfStreamError{
@@ -358,14 +375,31 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 					pe.CompletedAt = time.Now()
 					return &PolicyExecutionResult{BufferAction: BufferActionNone}
 				}
-				logrus.Debugf("Policy %s requested more data", p.Policy.Name())
+				logrus.Debugf("Policy %s requested next chunk", p.Policy.Name())
 				bufferAction = BufferActionBufferNext
 				break // Stop executing policies, wait for next chunk
-			}
 
-			// Update the byte index to current buffer size (policy consumed data)
-			p.status.lastExecutedBodyByteIndex = pe.requestBodyBuffer.Size()
-			p.status.lastExecutedStreamIndex = pe.requestBodyBuffer.StreamIndex()
+			case *BufferFullBody:
+				// Error if policy requests full buffer but stream has already ended
+				if pe.requestBodyBuffer.EndOfStream() {
+					pe.Error = &BufferMoreDataAtEndOfStreamError{
+						PolicyName: p.Policy.Name(),
+						Phase:      "request",
+					}
+					pe.Status = ExecutionStatusFailed
+					pe.CompletedAt = time.Now()
+					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+				}
+				logrus.Debugf("Policy %s requested full buffer", p.Policy.Name())
+				pe.waitingForFullRequestBuffer = true
+				bufferAction = BufferActionFullBuffer
+				break // Stop executing policies, wait for full buffer
+
+			default:
+				// Update the byte index to current buffer size (policy consumed data)
+				p.status.lastExecutedBodyByteIndex = pe.requestBodyBuffer.Size()
+				p.status.lastExecutedStreamIndex = pe.requestBodyBuffer.StreamIndex()
+			}
 		}
 
 		// Mark policy as completed if we've reached end of stream
@@ -410,6 +444,16 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 		}
 	}
 
+	// If waiting for full buffer and not end of stream, just continue buffering
+	if pe.waitingForFullResponseBuffer && !pe.responseBodyBuffer.EndOfStream() {
+		return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+	}
+
+	// Reset waiting flag if we reached end of stream
+	if pe.waitingForFullResponseBuffer && pe.responseBodyBuffer.EndOfStream() {
+		pe.waitingForFullResponseBuffer = false
+	}
+
 	bufferAction := BufferActionNone
 
 	for i := range pe.ResponsePolicies {
@@ -439,8 +483,9 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 		respCtx.Response.Body = originalBody
 
 		if result != nil {
-			// Check if policy requested more data
-			if _, isBufferNextChunk := result.Action.(*BufferNextChunk); isBufferNextChunk {
+			// Check what action the policy returned
+			switch result.Action.(type) {
+			case *BufferNextChunk:
 				// Error if policy requests more data but stream has already ended
 				if pe.responseBodyBuffer.EndOfStream() {
 					pe.Error = &BufferMoreDataAtEndOfStreamError{
@@ -451,14 +496,31 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 					pe.CompletedAt = time.Now()
 					return &PolicyExecutionResult{BufferAction: BufferActionNone}
 				}
-				logrus.Debugf("Policy %s requested more data", p.Policy.Name())
+				logrus.Debugf("Policy %s requested next chunk", p.Policy.Name())
 				bufferAction = BufferActionBufferNext
 				break // Stop executing policies, wait for next chunk
-			}
 
-			// Update the byte index to current buffer size (policy consumed data)
-			p.status.lastExecutedBodyByteIndex = pe.responseBodyBuffer.Size()
-			p.status.lastExecutedStreamIndex = pe.responseBodyBuffer.StreamIndex()
+			case *BufferFullBody:
+				// Error if policy requests full buffer but stream has already ended
+				if pe.responseBodyBuffer.EndOfStream() {
+					pe.Error = &BufferMoreDataAtEndOfStreamError{
+						PolicyName: p.Policy.Name(),
+						Phase:      "response",
+					}
+					pe.Status = ExecutionStatusFailed
+					pe.CompletedAt = time.Now()
+					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+				}
+				logrus.Debugf("Policy %s requested full buffer", p.Policy.Name())
+				pe.waitingForFullResponseBuffer = true
+				bufferAction = BufferActionFullBuffer
+				break // Stop executing policies, wait for full buffer
+
+			default:
+				// Update the byte index to current buffer size (policy consumed data)
+				p.status.lastExecutedBodyByteIndex = pe.responseBodyBuffer.Size()
+				p.status.lastExecutedStreamIndex = pe.responseBodyBuffer.StreamIndex()
+			}
 		}
 	}
 

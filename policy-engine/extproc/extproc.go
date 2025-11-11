@@ -124,6 +124,8 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				EndOfStream: value.RequestBody.EndOfStream,
 				StreamIndex: requestContext.Request.Body.StreamIndex + 1,
 			}
+
+			// Execute policies - they handle full buffer mode internally
 			result := policyExecution.ExecuteRequestPolicies(ctx, requestContext, bodyData)
 
 			// Check if buffer size exceeded or other fatal error
@@ -146,9 +148,30 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				continue
 			}
 
-			// If policy requested more data, send empty body mutation to continue streaming
-			if result.BufferAction == policy.BufferActionBufferNext {
-				logrus.Debug("Policy requested more data, continuing to buffer")
+			// Handle different buffer actions
+			switch result.BufferAction {
+			case policy.BufferActionBufferNext:
+				logrus.Debug("Policy requested next chunk, continuing to buffer")
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_RequestBody{
+						RequestBody: &ext_proc_pb.BodyResponse{
+							Response: &ext_proc_pb.CommonResponse{
+								BodyMutation: &ext_proc_pb.BodyMutation{
+									Mutation: &ext_proc_pb.BodyMutation_Body{
+										Body: []byte{}, // Empty mutation continues streaming
+									},
+								},
+							},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending continue buffering response", err)
+				}
+				continue
+
+			case policy.BufferActionFullBuffer:
+				logrus.Debug("Policy requested full buffer, continuing to buffer until end of stream")
 				resp = &ext_proc_pb.ProcessingResponse{
 					Response: &ext_proc_pb.ProcessingResponse_RequestBody{
 						RequestBody: &ext_proc_pb.BodyResponse{
@@ -262,9 +285,33 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				continue
 			}
 
-			// If policy requested more data, send empty body mutation to continue streaming
-			if result.BufferAction == policy.BufferActionBufferNext {
-				logrus.Debug("Policy requested more data, continuing to buffer")
+			// Handle different buffer actions
+			switch result.BufferAction {
+			case policy.BufferActionBufferNext:
+				logrus.Debug("Policy requested next chunk, continuing to buffer")
+				resp = &ext_proc_pb.ProcessingResponse{
+					Response: &ext_proc_pb.ProcessingResponse_ResponseBody{
+						ResponseBody: &ext_proc_pb.BodyResponse{
+							Response: &ext_proc_pb.CommonResponse{
+								BodyMutation: &ext_proc_pb.BodyMutation{
+									Mutation: &ext_proc_pb.BodyMutation_StreamedResponse{
+										StreamedResponse: &ext_proc_pb.StreamedBodyResponse{
+											Body:        []byte{}, // Empty mutation continues streaming
+											EndOfStream: false,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+				if err := processServer.Send(resp); err != nil {
+					logrus.Error("Error sending continue buffering response", err)
+				}
+				continue
+
+			case policy.BufferActionFullBuffer:
+				logrus.Debug("Policy requested full buffer, continuing to buffer until end of stream")
 				resp = &ext_proc_pb.ProcessingResponse{
 					Response: &ext_proc_pb.ProcessingResponse_ResponseBody{
 						ResponseBody: &ext_proc_pb.BodyResponse{
