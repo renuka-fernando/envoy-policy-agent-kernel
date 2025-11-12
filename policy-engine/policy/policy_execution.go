@@ -92,6 +92,13 @@ const (
 type PolicyExecutionResult struct {
 	// BufferAction indicates what buffering action is required
 	BufferAction BufferAction
+
+	// RequestResults contains the list of request policy results from execution
+	// If an ImmediateResponse is encountered, this will contain only that result
+	RequestResults []*RequestResult
+
+	// ResponseResults contains the list of response policy results from execution
+	ResponseResults []*ResponseResult
 }
 
 // BodyBuffer accumulates body chunks across streaming requests/responses.
@@ -320,19 +327,27 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 			pe.Error = err
 			pe.Status = ExecutionStatusFailed
 			pe.CompletedAt = time.Now()
-			return &PolicyExecutionResult{BufferAction: BufferActionNone}
+			return &PolicyExecutionResult{
+				BufferAction:   BufferActionNone,
+				RequestResults: []*RequestResult{},
+			}
 		}
 	}
 
 	// If waiting for full buffer and not end of stream, just continue buffering
 	if pe.waitingForFullRequestBuffer && !pe.requestBodyBuffer.EndOfStream() {
-		return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+		return &PolicyExecutionResult{
+			BufferAction:   BufferActionFullBuffer,
+			RequestResults: []*RequestResult{},
+		}
 	}
 
 	// Reset waiting flag if we reached end of stream
 	if pe.waitingForFullRequestBuffer && pe.requestBodyBuffer.EndOfStream() {
 		pe.waitingForFullRequestBuffer = false
 	}
+
+	var requestResults []*RequestResult
 
 	for i := range pe.RequestPolicies {
 		p := &pe.RequestPolicies[i]
@@ -345,8 +360,21 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 
 		// Policies that don't access request body execute once and complete
 		if !p.Policy.AccessRequestBody() {
-			_ = p.Policy.HandleRequest(ctx, reqCtx)
+			result := p.Policy.HandleRequest(ctx, reqCtx)
 			p.status.isCompleted = true
+
+			// Collect result if returned
+			if result != nil {
+				requestResults = append(requestResults, result)
+
+				// If ImmediateResponse, override results and return immediately
+				if _, isImmediateResponse := result.Action.(*ImmediateResponse); isImmediateResponse {
+					return &PolicyExecutionResult{
+						BufferAction:   BufferActionNone,
+						RequestResults: []*RequestResult{result},
+					}
+				}
+			}
 			continue
 		}
 
@@ -364,6 +392,13 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 		if result != nil {
 			// Check what action the policy returned
 			switch action := result.Action.(type) {
+			case *ImmediateResponse:
+				// Immediate response - return immediately with only this result
+				return &PolicyExecutionResult{
+					BufferAction:   BufferActionNone,
+					RequestResults: []*RequestResult{result},
+				}
+
 			case *BufferNextChunk, *BufferFullBody:
 				// Error if policy requests more data but stream has already ended
 				if pe.requestBodyBuffer.EndOfStream() {
@@ -373,20 +408,32 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 					}
 					pe.Status = ExecutionStatusFailed
 					pe.CompletedAt = time.Now()
-					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+					return &PolicyExecutionResult{
+						BufferAction:   BufferActionNone,
+						RequestResults: requestResults,
+					}
 				}
 
 				// Handle the specific buffer action
 				if _, isBufferNext := action.(*BufferNextChunk); isBufferNext {
 					logrus.Debugf("Policy %s requested BufferNextChunk", p.Policy.Name())
-					return &PolicyExecutionResult{BufferAction: BufferActionBufferNext}
+					return &PolicyExecutionResult{
+						BufferAction:   BufferActionBufferNext,
+						RequestResults: requestResults,
+					}
 				} else {
 					logrus.Debugf("Policy %s requested BufferFullBody", p.Policy.Name())
 					pe.waitingForFullRequestBuffer = true
-					return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+					return &PolicyExecutionResult{
+						BufferAction:   BufferActionFullBuffer,
+						RequestResults: requestResults,
+					}
 				}
 
 			default:
+				// Collect the result
+				requestResults = append(requestResults, result)
+
 				// Update the byte index to current buffer size (policy consumed data)
 				p.status.lastExecutedBodyByteIndex = pe.requestBodyBuffer.Size()
 				p.status.lastExecutedStreamIndex = pe.requestBodyBuffer.StreamIndex()
@@ -405,7 +452,10 @@ func (pe *PolicyExecution) ExecuteRequestPolicies(ctx context.Context, reqCtx *R
 		pe.CompletedAt = time.Now()
 	}
 
-	return &PolicyExecutionResult{BufferAction: BufferActionNone}
+	return &PolicyExecutionResult{
+		BufferAction:   BufferActionNone,
+		RequestResults: requestResults,
+	}
 }
 
 // ExecuteResponsePolicies executes all response policies for response processing.
@@ -431,13 +481,19 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 			pe.Error = err
 			pe.Status = ExecutionStatusFailed
 			pe.CompletedAt = time.Now()
-			return &PolicyExecutionResult{BufferAction: BufferActionNone}
+			return &PolicyExecutionResult{
+				BufferAction:    BufferActionNone,
+				ResponseResults: []*ResponseResult{},
+			}
 		}
 	}
 
 	// If waiting for full buffer and not end of stream, just continue buffering
 	if pe.waitingForFullResponseBuffer && !pe.responseBodyBuffer.EndOfStream() {
-		return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+		return &PolicyExecutionResult{
+			BufferAction:    BufferActionFullBuffer,
+			ResponseResults: []*ResponseResult{},
+		}
 	}
 
 	// Reset waiting flag if we reached end of stream
@@ -445,12 +501,19 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 		pe.waitingForFullResponseBuffer = false
 	}
 
+	var responseResults []*ResponseResult
+
 	for i := range pe.ResponsePolicies {
 		p := &pe.ResponsePolicies[i]
 
 		// Policies that don't access response body execute once and complete
 		if !p.Policy.AccessResponseBody() {
-			_ = p.Policy.HandleResponse(ctx, respCtx)
+			result := p.Policy.HandleResponse(ctx, respCtx)
+
+			// Collect result if returned
+			if result != nil {
+				responseResults = append(responseResults, result)
+			}
 			continue
 		}
 
@@ -483,20 +546,32 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 					}
 					pe.Status = ExecutionStatusFailed
 					pe.CompletedAt = time.Now()
-					return &PolicyExecutionResult{BufferAction: BufferActionNone}
+					return &PolicyExecutionResult{
+						BufferAction:    BufferActionNone,
+						ResponseResults: responseResults,
+					}
 				}
 
 				// Handle the specific buffer action
 				if _, isBufferNext := action.(*BufferNextChunk); isBufferNext {
 					logrus.Debugf("Policy %s requested BufferNextChunk", p.Policy.Name())
-					return &PolicyExecutionResult{BufferAction: BufferActionBufferNext}
+					return &PolicyExecutionResult{
+						BufferAction:    BufferActionBufferNext,
+						ResponseResults: responseResults,
+					}
 				} else {
 					logrus.Debugf("Policy %s requested BufferFullBody", p.Policy.Name())
 					pe.waitingForFullResponseBuffer = true
-					return &PolicyExecutionResult{BufferAction: BufferActionFullBuffer}
+					return &PolicyExecutionResult{
+						BufferAction:    BufferActionFullBuffer,
+						ResponseResults: responseResults,
+					}
 				}
 
 			default:
+				// Collect the result
+				responseResults = append(responseResults, result)
+
 				// Update the byte index to current buffer size (policy consumed data)
 				p.status.lastExecutedBodyByteIndex = pe.responseBodyBuffer.Size()
 				p.status.lastExecutedStreamIndex = pe.responseBodyBuffer.StreamIndex()
@@ -504,5 +579,8 @@ func (pe *PolicyExecution) ExecuteResponsePolicies(ctx context.Context, respCtx 
 		}
 	}
 
-	return &PolicyExecutionResult{BufferAction: BufferActionNone}
+	return &PolicyExecutionResult{
+		BufferAction:    BufferActionNone,
+		ResponseResults: responseResults,
+	}
 }
