@@ -140,8 +140,8 @@ static_resources:
                       processing_mode:
                         request_header_mode: SEND
                         response_header_mode: SEND
-                        # request_trailer_mode: SEND
-                        # response_trailer_mode: SEND
+                        request_trailer_mode: SEND
+                        response_trailer_mode: SEND
                         # https://www.envoyproxy.io/docs/envoy/v1.33.0/api-v3/extensions/filters/http/ext_proc/v3/processing_mode.proto#envoy-v3-api-enum-extensions-filters-http-ext-proc-v3-processingmode-bodysendmode
                         request_body_mode: FULL_DUPLEX_STREAMED
                         response_body_mode: FULL_DUPLEX_STREAMED

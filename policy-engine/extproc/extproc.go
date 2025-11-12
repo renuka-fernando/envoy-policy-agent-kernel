@@ -37,7 +37,7 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 	}
 
 	responseContext := &policy.ResponseContext{
-		Request:  &policy.RequestData{}, // Will be populated from requestContext
+		Request: &policy.RequestData{}, // Will be populated from requestContext
 		Response: &policy.ResponseData{
 			Body: &policy.BodyData{
 				Included:    false,
@@ -113,7 +113,6 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 			}
 
 			// Execute policies for request headers
-			// Note: needMoreData will be false here since we haven't received body yet
 			_ = policyExecution.ExecuteRequestPolicies(ctx, requestContext, nil)
 
 		case *ext_proc_pb.ProcessingRequest_RequestBody:
@@ -125,7 +124,7 @@ func (s *server) Process(processServer ext_proc_svc.ExternalProcessor_ProcessSer
 				StreamIndex: requestContext.Request.Body.StreamIndex + 1,
 			}
 
-			// Execute policies - they handle full buffer mode internally
+			// Execute policies with request body
 			result := policyExecution.ExecuteRequestPolicies(ctx, requestContext, bodyData)
 
 			// Check if buffer size exceeded or other fatal error
